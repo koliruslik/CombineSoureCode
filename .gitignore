@@ -1,0 +1,7 @@
+# Generated code-combiner reports
+CodeOutput/
+combined_code.txt
+
+# Python cache files
+__pycache__/
+*.py[cod]
