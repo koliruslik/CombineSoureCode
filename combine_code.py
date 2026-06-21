@@ -1,508 +1,42 @@
 #!/usr/bin/env python3
 """
-combine_code.py
+Command-line and interactive launcher for the Code Listing Combiner.
 
-Collects source files from one or more directories, writes them into one text
-file, and reports common language declarations such as classes, interfaces,
-enums, structs, and similar constructs.
-
-The script can be used interactively or through command-line arguments.
-Existing output files are rebuilt and replaced; new output files are created.
+The launcher gathers user choices and delegates scanning, statistics, and output
+replacement to combiner_core.py.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import tempfile
-from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Pattern
+from typing import Sequence
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-DEFAULT_EXTENSIONS = {
-    # C#
-    ".cs", ".csx",
-    # C / C++
-    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx",
-    # JVM languages
-    ".java", ".kt", ".kts",
-    # JavaScript / TypeScript
-    ".js", ".jsx", ".ts", ".tsx",
-    # Other programming languages
-    ".py", ".go", ".rs", ".gd", ".gdshader", ".lua", ".php",
-    ".rb", ".swift",
-    # Scripts, database, and web files
-    ".sh", ".ps1", ".bat", ".sql", ".html", ".css", ".scss",
-}
-
-SKIPPED_DIRECTORIES = {
-    ".git",
-    ".idea",
-    ".vs",
-    ".vscode",
-    ".godot",
-    ".import",
-    ".mono",
-    ".pytest_cache",
-    "__pycache__",
-    "bin",
-    "obj",
-    "node_modules",
-    "build",
-    "dist",
-    "out",
-}
-
-SKIPPED_DIRECTORY_NAMES = {
-    directory.casefold()
-    for directory in SKIPPED_DIRECTORIES
-}
-
-IDENTIFIER = r"@?[A-Za-z_][A-Za-z0-9_]*"
-
-
-# =============================================================================
-# Declaration rules
-# =============================================================================
-
-@dataclass(frozen=True)
-class DeclarationRule:
-    """A label and a regular expression used to count one declaration type."""
-
-    label: str
-    pattern: Pattern[str]
-
-
-def make_rule(label: str, pattern: str, flags: int = 0) -> DeclarationRule:
-    """Create a multiline declaration rule."""
-    return DeclarationRule(
-        label=label,
-        pattern=re.compile(pattern, re.MULTILINE | flags),
-    )
-
-
-def rule_set(*items: DeclarationRule) -> tuple[DeclarationRule, ...]:
-    """Make declaration-rule definitions easier to read."""
-    return items
-
-
-CS_RULES = rule_set(
-    make_rule("Records", rf"\brecord(?:\s+(?:class|struct))?\s+{IDENTIFIER}\b"),
-    make_rule("Delegates", rf"\bdelegate\s+[^;{{}}()]*?{IDENTIFIER}\s*\("),
-    make_rule("Interfaces", rf"\binterface\s+{IDENTIFIER}\b"),
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Structs", rf"\bstruct\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Namespaces", rf"\bnamespace\s+{IDENTIFIER}(?:\s*\.\s*{IDENTIFIER})*"),
-)
-
-CPP_RULES = rule_set(
-    make_rule("Enums", rf"\benum(?:\s+(?:class|struct))?\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Structs", rf"\bstruct\s+{IDENTIFIER}\b"),
-    make_rule("Unions", rf"\bunion\s+{IDENTIFIER}\b"),
-    make_rule("Concepts", rf"\bconcept\s+{IDENTIFIER}\b"),
-    make_rule("Namespaces", rf"\bnamespace\s+{IDENTIFIER}(?:\s*::\s*{IDENTIFIER})*"),
-)
-
-C_RULES = rule_set(
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Structs", rf"\bstruct\s+{IDENTIFIER}\b"),
-    make_rule("Unions", rf"\bunion\s+{IDENTIFIER}\b"),
-    make_rule("Typedefs", rf"\btypedef\b[^;{{}}]*?\b{IDENTIFIER}\s*;"),
-)
-
-JAVA_RULES = rule_set(
-    make_rule("Annotations", rf"@\s*interface\s+{IDENTIFIER}\b"),
-    make_rule("Records", rf"\brecord\s+{IDENTIFIER}\b"),
-    make_rule("Interfaces", rf"\binterface\s+{IDENTIFIER}\b"),
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Packages", rf"\bpackage\s+{IDENTIFIER}(?:\s*\.\s*{IDENTIFIER})*\s*;"),
-)
-
-KOTLIN_RULES = rule_set(
-    make_rule("Enums", rf"\benum\s+class\s+{IDENTIFIER}\b"),
-    make_rule("Annotations", rf"\bannotation\s+class\s+{IDENTIFIER}\b"),
-    make_rule("Objects", rf"\b(?:companion\s+)?object\s+{IDENTIFIER}\b"),
-    make_rule("Type aliases", rf"\btypealias\s+{IDENTIFIER}\s*="),
-    make_rule("Interfaces", rf"\binterface\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-)
-
-TYPESCRIPT_RULES = rule_set(
-    make_rule("Enums", rf"\b(?:const\s+)?enum\s+{IDENTIFIER}\b"),
-    make_rule("Interfaces", rf"\binterface\s+{IDENTIFIER}\b"),
-    make_rule("Type aliases", rf"\btype\s+{IDENTIFIER}(?:<[^>]+>)?\s*="),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Namespaces", rf"\b(?:namespace|module)\s+{IDENTIFIER}\b"),
-)
-
-PYTHON_RULES = rule_set(
-    make_rule("Classes", rf"^\s*class\s+{IDENTIFIER}\b"),
-)
-
-GO_RULES = rule_set(
-    make_rule("Interfaces", rf"\btype\s+{IDENTIFIER}(?:\[[^\]]+\])?\s+interface\b"),
-    make_rule("Structs", rf"\btype\s+{IDENTIFIER}(?:\[[^\]]+\])?\s+struct\b"),
-    make_rule("Type aliases", rf"\btype\s+{IDENTIFIER}\s*="),
-    make_rule("Types", rf"\btype\s+{IDENTIFIER}(?:\[[^\]]+\])?\s+[A-Za-z_][A-Za-z0-9_]*"),
-)
-
-RUST_RULES = rule_set(
-    make_rule("Structs", rf"\bstruct\s+{IDENTIFIER}\b"),
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Traits", rf"\btrait\s+{IDENTIFIER}\b"),
-    make_rule("Unions", rf"\bunion\s+{IDENTIFIER}\b"),
-    make_rule("Type aliases", rf"\btype\s+{IDENTIFIER}(?:<[^>]+>)?\s*="),
-    make_rule("Modules", rf"\bmod\s+{IDENTIFIER}\b"),
-)
-
-GDSCRIPT_RULES = rule_set(
-    make_rule("Classes", rf"^\s*class_name\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"^\s*class\s+{IDENTIFIER}\b"),
-)
-
-PHP_RULES = rule_set(
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Interfaces", rf"\binterface\s+{IDENTIFIER}\b"),
-    make_rule("Traits", rf"\btrait\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Namespaces", rf"\bnamespace\s+{IDENTIFIER}(?:\s*\\\s*{IDENTIFIER})*"),
-)
-
-SWIFT_RULES = rule_set(
-    make_rule("Protocols", rf"\bprotocol\s+{IDENTIFIER}\b"),
-    make_rule("Actors", rf"\bactor\s+{IDENTIFIER}\b"),
-    make_rule("Structs", rf"\bstruct\s+{IDENTIFIER}\b"),
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-    make_rule("Extensions", rf"\bextension\s+{IDENTIFIER}\b"),
-)
-
-RUBY_RULES = rule_set(
-    make_rule("Classes", rf"^\s*class\s+{IDENTIFIER}\b"),
-    make_rule("Modules", rf"^\s*module\s+{IDENTIFIER}\b"),
-)
-
-POWERSHELL_RULES = rule_set(
-    make_rule("Enums", rf"\benum\s+{IDENTIFIER}\b"),
-    make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b"),
-)
-
-SQL_RULES = rule_set(
-    make_rule(
-        "Tables",
-        rf"\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{IDENTIFIER}\b",
-        re.IGNORECASE,
-    ),
-    make_rule(
-        "Views",
-        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+{IDENTIFIER}\b",
-        re.IGNORECASE,
-    ),
-    make_rule(
-        "Functions",
-        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+{IDENTIFIER}\b",
-        re.IGNORECASE,
-    ),
-    make_rule(
-        "Procedures",
-        rf"\bCREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\s+{IDENTIFIER}\b",
-        re.IGNORECASE,
-    ),
-    make_rule("Types", rf"\bCREATE\s+TYPE\s+{IDENTIFIER}\b", re.IGNORECASE),
-    make_rule("Schemas", rf"\bCREATE\s+SCHEMA\s+{IDENTIFIER}\b", re.IGNORECASE),
-)
-
-LANGUAGE_RULES: dict[str, tuple[DeclarationRule, ...]] = {
-    ".cs": CS_RULES,
-    ".csx": CS_RULES,
-    ".c": C_RULES,
-    ".java": JAVA_RULES,
-    ".kt": KOTLIN_RULES,
-    ".kts": KOTLIN_RULES,
-    ".ts": TYPESCRIPT_RULES,
-    ".tsx": TYPESCRIPT_RULES,
-    ".js": rule_set(make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b")),
-    ".jsx": rule_set(make_rule("Classes", rf"\bclass\s+{IDENTIFIER}\b")),
-    ".py": PYTHON_RULES,
-    ".go": GO_RULES,
-    ".rs": RUST_RULES,
-    ".gd": GDSCRIPT_RULES,
-    ".php": PHP_RULES,
-    ".swift": SWIFT_RULES,
-    ".rb": RUBY_RULES,
-    ".ps1": POWERSHELL_RULES,
-    ".sql": SQL_RULES,
-}
-
-for cpp_extension in {".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"}:
-    LANGUAGE_RULES[cpp_extension] = CPP_RULES
-
-
-# =============================================================================
-# Comment and string masking for declaration analysis
-# =============================================================================
-
-C_LIKE_EXTENSIONS = {
-    ".cs", ".csx", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh",
-    ".hxx", ".java", ".kt", ".kts", ".js", ".jsx", ".ts", ".tsx", ".go",
-    ".rs", ".php", ".swift",
-}
-
-HASH_COMMENT_EXTENSIONS = {".py", ".rb", ".sh", ".ps1", ".bat", ".gd", ".gdshader"}
-
-C_LIKE_NOISE = re.compile(
-    r'''
-    //[^\n]*                           |
-    /\*.*?\*/                          |
-    @?"(?:""|[^"\\])*"               |
-    "{3}.*?"{3}                        |
-    "(?:\\.|[^"\\])*"               |
-    '(?:\\.|[^'\\])*'                 |
-    `(?:\\.|[^`\\])*`
-    ''',
-    re.DOTALL | re.VERBOSE,
-)
-
-HASH_COMMENT_NOISE = re.compile(
-    r'''
-    \#[^\n]*                           |
-    '{3}.*?'{3}                        |
-    "{3}.*?"{3}                        |
-    "(?:\\.|[^"\\])*"               |
-    '(?:\\.|[^'\\])*'
-    ''',
-    re.DOTALL | re.VERBOSE,
-)
-
-SQL_NOISE = re.compile(
-    r'''
-    --[^\n]*                           |
-    /\*.*?\*/                          |
-    '(?:''|[^'])*'
-    ''',
-    re.DOTALL | re.VERBOSE,
+from combiner_core import (
+    DEFAULT_EXTENSIONS,
+    build_exclusion_settings,
+    collect_source_files,
+    format_stats,
+    normalize_extensions,
+    normalize_output_path,
+    split_option_values,
+    validate_folders,
+    write_combined_output,
 )
 
 
 # =============================================================================
-# Data types
+# Interactive input helpers
 # =============================================================================
-
-@dataclass(frozen=True)
-class SourceFile:
-    """A discovered source file and the selected root that supplied it."""
-
-    path: Path
-    source_root: Path
-
-
-# =============================================================================
-# File and analysis helpers
-# =============================================================================
-
-def should_skip(relative_path: Path) -> bool:
-    """Return True when any part of a path is a configured ignored directory."""
-    return any(
-        path_part.casefold() in SKIPPED_DIRECTORY_NAMES
-        for path_part in relative_path.parts
-    )
-
-
-def read_file_safely(file_path: Path) -> str | None:
-    """Read a non-binary source file using common project encodings."""
-    try:
-        raw_data = file_path.read_bytes()
-    except OSError as error:
-        print(f"[Read error] {file_path}: {error}")
-        return None
-
-    if b"\x00" in raw_data:
-        print(f"[Skipped binary-looking file] {file_path}")
-        return None
-
-    for encoding in ("utf-8", "utf-8-sig", "cp1251"):
-        try:
-            return raw_data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-
-    print(f"[Skipped unknown encoding] {file_path}")
-    return None
-
-
-def normalize_extensions(values: list[str] | None) -> set[str]:
-    """Return normalized extension filters, including the leading dot."""
-    if not values:
-        return set(DEFAULT_EXTENSIONS)
-
-    normalized: set[str] = set()
-
-    for value in values:
-        cleaned_value = value.strip().lower()
-
-        if not cleaned_value:
-            continue
-
-        if not cleaned_value.startswith("."):
-            cleaned_value = f".{cleaned_value}"
-
-        normalized.add(cleaned_value)
-
-    return normalized
-
-
-def mask_keep_newlines(text: str) -> str:
-    """Replace text with spaces while preserving line breaks for regex anchors."""
-    return "".join("\n" if character == "\n" else " " for character in text)
-
-
-def strip_non_code(content: str, extension: str) -> str:
-    """Mask common comments and literals before declaration matching."""
-    if extension in C_LIKE_EXTENSIONS:
-        return C_LIKE_NOISE.sub(lambda match: mask_keep_newlines(match.group(0)), content)
-
-    if extension in HASH_COMMENT_EXTENSIONS:
-        return HASH_COMMENT_NOISE.sub(lambda match: mask_keep_newlines(match.group(0)), content)
-
-    if extension == ".sql":
-        return SQL_NOISE.sub(lambda match: mask_keep_newlines(match.group(0)), content)
-
-    return content
-
-
-def count_declarations(content: str, extension: str) -> Counter[str]:
-    """Count declaration categories supported for the file's language."""
-    declaration_rules = LANGUAGE_RULES.get(extension)
-
-    if declaration_rules is None:
-        return Counter()
-
-    masked_content = strip_non_code(content, extension)
-    result: Counter[str] = Counter()
-
-    for declaration_rule in declaration_rules:
-        matches = list(declaration_rule.pattern.finditer(masked_content))
-
-        if not matches:
-            continue
-
-        result[declaration_rule.label] += len(matches)
-
-        # Mask already counted declarations. This prevents, for example,
-        # "record class User" from being counted as both Record and Class.
-        masked_content = declaration_rule.pattern.sub(
-            lambda match: mask_keep_newlines(match.group(0)),
-            masked_content,
-        )
-
-    return result
-
-
-STAT_ORDER = {
-    "Namespaces": 0,
-    "Packages": 1,
-    "Schemas": 2,
-    "Modules": 3,
-    "Classes": 10,
-    "Records": 11,
-    "Structs": 12,
-    "Interfaces": 13,
-    "Protocols": 14,
-    "Traits": 15,
-    "Enums": 16,
-    "Unions": 17,
-    "Delegates": 18,
-    "Objects": 19,
-    "Actors": 20,
-    "Annotations": 21,
-    "Concepts": 22,
-    "Type aliases": 23,
-    "Types": 24,
-    "Typedefs": 25,
-    "Extensions": 26,
-    "Tables": 30,
-    "Views": 31,
-    "Functions": 32,
-    "Procedures": 33,
-}
-
-
-def format_stats(stats: Counter[str]) -> str:
-    """Format declaration statistics for the combined output and terminal."""
-    if not stats:
-        return "—"
-
-    sorted_items = sorted(
-        stats.items(),
-        key=lambda item: (STAT_ORDER.get(item[0], 999), item[0].casefold()),
-    )
-
-    return ", ".join(f"{label}: {count}" for label, count in sorted_items)
-
-
-# =============================================================================
-# Folder selection
-# =============================================================================
-
-def normalize_folder_path(value: str) -> Path | None:
-    """Turn a user-provided folder string into an absolute path."""
-    cleaned_value = value.strip().strip('"').strip("'")
-
-    if not cleaned_value:
-        return None
-
-    path = Path(cleaned_value).expanduser()
-
-    if not path.is_absolute():
-        path = Path.cwd() / path
-
-    try:
-        return path.resolve()
-    except (OSError, RuntimeError):
-        return path.absolute()
-
-
-def validate_folders(raw_paths: list[str]) -> list[Path]:
-    """Keep only unique, existing directories from user input."""
-    folders: list[Path] = []
-    seen: set[Path] = set()
-
-    for raw_path in raw_paths:
-        folder = normalize_folder_path(raw_path)
-
-        if folder is None:
-            continue
-
-        if not folder.is_dir():
-            print(f"[Skipped: not a directory] {folder}")
-            continue
-
-        if folder in seen:
-            continue
-
-        seen.add(folder)
-        folders.append(folder)
-
-    return folders
 
 
 def split_manual_paths(raw_value: str) -> list[str]:
-    """Allow several manually entered paths separated by semicolons."""
-    return [value.strip() for value in raw_value.split(";") if value.strip()]
+    """Allow several source-folder paths separated by semicolons."""
+    return split_option_values([raw_value])
 
 
 def enter_folders_manually() -> list[Path]:
-    """Ask for one or more folder paths in the console."""
+    """Ask for one or more source-folder paths in the terminal."""
     print()
     print("Enter source folders one at a time.")
     print("You may enter multiple paths separated with a semicolon (;).")
@@ -529,7 +63,7 @@ def enter_folders_manually() -> list[Path]:
 
 
 def choose_folders_from_dialog() -> list[Path]:
-    """Open the native folder-picker dialog and allow repeated selection."""
+    """Open the native folder picker and allow repeated selection."""
     try:
         import tkinter as tk
         from tkinter import filedialog, messagebox
@@ -571,9 +105,10 @@ def choose_folders_from_dialog() -> list[Path]:
     return validate_folders(selected_paths)
 
 
-def get_source_directories(args: argparse.Namespace) -> list[Path]:
-    """Resolve source directories from command-line and interactive choices."""
+def get_source_directories(args: argparse.Namespace) -> tuple[list[Path], bool]:
+    """Resolve source roots and report whether the user is in interactive mode."""
     folders: list[Path] = []
+    interactive_mode = not args.folders and not args.choose
 
     if args.folders:
         folders.extend(validate_folders(args.folders))
@@ -581,11 +116,11 @@ def get_source_directories(args: argparse.Namespace) -> list[Path]:
     if args.choose:
         folders.extend(choose_folders_from_dialog())
 
-    if not args.folders and not args.choose:
+    if interactive_mode:
         print("How would you like to select source folders?")
-        print("1 — Enter paths manually")
-        print("2 — Select folders in a window")
-        print("3 — Use both methods")
+        print("1 - Enter paths manually")
+        print("2 - Select folders in a window")
+        print("3 - Use both methods")
 
         try:
             choice = input("Choice [1]: ").strip() or "1"
@@ -610,33 +145,11 @@ def get_source_directories(args: argparse.Namespace) -> list[Path]:
             seen.add(folder)
             unique_folders.append(folder)
 
-    return unique_folders
-
-
-# =============================================================================
-# Output path selection
-# =============================================================================
-
-def normalize_output_path(value: str, root: Path) -> Path:
-    """Resolve an output file path relative to the selected output root."""
-    cleaned_value = value.strip().strip('"').strip("'")
-
-    if not cleaned_value:
-        cleaned_value = "combined_code.txt"
-
-    output_path = Path(cleaned_value).expanduser()
-
-    if not output_path.is_absolute():
-        output_path = root / output_path
-
-    try:
-        return output_path.resolve()
-    except (OSError, RuntimeError):
-        return output_path.absolute()
+    return unique_folders, interactive_mode
 
 
 def get_output_path(args: argparse.Namespace, root: Path) -> Path:
-    """Use --output when supplied; otherwise ask the user for a file name."""
+    """Use --output when supplied; otherwise request an output file path."""
     if args.output:
         return normalize_output_path(args.output, root)
 
@@ -652,185 +165,50 @@ def get_output_path(args: argparse.Namespace, root: Path) -> Path:
     return normalize_output_path(raw_value or "combined_code.txt", root)
 
 
-# =============================================================================
-# Source file discovery
-# =============================================================================
-
-def collect_source_files(
-    source_directories: list[Path],
-    output_path: Path,
-    extensions: set[str],
-) -> list[SourceFile]:
-    """Recursively collect unique code files from all chosen source folders."""
-    source_files: list[SourceFile] = []
-    seen_files: set[Path] = set()
-
-    for source_directory in source_directories:
-        for current_directory, directory_names, file_names in os.walk(
-            source_directory,
-            followlinks=False,
-        ):
-            # Prevent os.walk from descending into ignored directories.
-            directory_names[:] = [
-                directory_name
-                for directory_name in directory_names
-                if directory_name.casefold() not in SKIPPED_DIRECTORY_NAMES
-            ]
-
-            current_path = Path(current_directory)
-
-            for file_name in file_names:
-                file_path = current_path / file_name
-
-                try:
-                    relative_path = file_path.relative_to(source_directory)
-                except ValueError:
-                    continue
-
-                if should_skip(relative_path):
-                    continue
-
-                if file_path.suffix.lower() not in extensions:
-                    continue
-
-                try:
-                    resolved_path = file_path.resolve()
-                except (OSError, RuntimeError):
-                    continue
-
-                # This protects against scanning the output file when it is
-                # stored inside one of the chosen source directories.
-                if resolved_path == output_path:
-                    continue
-
-                if resolved_path in seen_files:
-                    continue
-
-                if not resolved_path.is_file():
-                    continue
-
-                seen_files.add(resolved_path)
-                source_files.append(
-                    SourceFile(path=resolved_path, source_root=source_directory)
-                )
-
-    return sorted(
-        source_files,
-        key=lambda source_file: (
-            str(source_file.source_root).casefold(),
-            str(source_file.path).casefold(),
-        ),
-    )
-
-
-def display_file_path(source_file: SourceFile) -> str:
-    """Return a readable path relative to the source root when possible."""
-    try:
-        relative_path = source_file.path.relative_to(source_file.source_root)
-        return relative_path.as_posix()
-    except ValueError:
-        return str(source_file.path)
-
-
-# =============================================================================
-# Combined output generation
-# =============================================================================
-
-def write_combined_output(
-    output_path: Path,
-    source_directories: list[Path],
-    source_files: list[SourceFile],
-) -> tuple[int, int, Counter[str], Counter[str]]:
-    """
-    Write the combined code report to a temporary file and atomically replace
-    the target file. Returns included-file count, skipped-file count, total
-    declaration statistics, and file counts by extension.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if output_path.exists() and output_path.is_dir():
-        raise IsADirectoryError(f"Output path is a directory: {output_path}")
-
-    total_stats: Counter[str] = Counter()
-    files_by_extension: Counter[str] = Counter()
-    included_files = 0
-    skipped_files = 0
-    temporary_path: Path | None = None
+def prompt_additional_extensions() -> list[str]:
+    """Ask for optional formats that should be added to default extensions."""
+    print()
+    print("Additional file extensions to include (optional).")
+    print("Example: .shader; .txt; .proto")
 
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            delete=False,
-            dir=output_path.parent,
-            prefix=f".{output_path.name}.",
-            suffix=".tmp",
-        ) as output:
-            temporary_path = Path(output.name)
+        raw_value = input("Additional extensions [none]: ").strip()
+    except EOFError:
+        raw_value = ""
 
-            output.write("COMBINED SOURCE CODE\n")
-            output.write("=" * 100 + "\n")
-            output.write("Selected source folders:\n")
+    return split_option_values([raw_value])
 
-            for source_directory in source_directories:
-                output.write(f"  {source_directory}\n")
 
-            output.write(f"\nFiles found: {len(source_files)}\n\n")
+def prompt_exclusions() -> list[str]:
+    """Ask for optional directory names or paths that should be skipped."""
+    print()
+    print("Additional folder names or paths to exclude (optional).")
+    print("A name such as vendor excludes it at every depth.")
+    print("Example: generated; external; source/legacy")
 
-            for source_file in source_files:
-                content = read_file_safely(source_file.path)
+    try:
+        raw_value = input("Additional exclusions [none]: ").strip()
+    except EOFError:
+        raw_value = ""
 
-                if content is None:
-                    skipped_files += 1
-                    continue
+    return split_option_values([raw_value])
 
-                extension = source_file.path.suffix.lower()
-                file_stats = count_declarations(content, extension)
-                visible_path = display_file_path(source_file)
 
-                total_stats.update(file_stats)
-                files_by_extension[extension] += 1
-                included_files += 1
+def prompt_file_timestamps() -> bool:
+    """Ask whether every report entry should include its last-modified time."""
+    print()
+    try:
+        answer = input("Include last-modified timestamps for source files? [Y/n]: ").strip()
+    except EOFError:
+        answer = ""
 
-                output.write("=" * 100 + "\n")
-                output.write(f"SOURCE ROOT: {source_file.source_root}\n")
-                output.write(f"FILE: {visible_path}\n")
-                output.write(f"DECLARATIONS: {format_stats(file_stats)}\n")
-                output.write("=" * 100 + "\n\n")
-                output.write(content.rstrip())
-                output.write("\n\n")
-
-            output.write("=" * 100 + "\n")
-            output.write("PROJECT STATISTICS\n")
-            output.write("=" * 100 + "\n")
-            output.write(f"Files included: {included_files}\n")
-            output.write(f"Files skipped: {skipped_files}\n")
-            output.write(f"Declarations: {format_stats(total_stats)}\n\n")
-            output.write("Files by extension:\n")
-
-            for extension, count in sorted(files_by_extension.items()):
-                output.write(f"  {extension}: {count}\n")
-
-        # Path.replace() replaces an existing output file instead of creating
-        # a second file with a different name. The temporary file also protects
-        # the old report if an error occurs while collecting source content.
-        temporary_path.replace(output_path)
-
-    except Exception:
-        if temporary_path is not None and temporary_path.exists():
-            try:
-                temporary_path.unlink()
-            except OSError:
-                pass
-        raise
-
-    return included_files, skipped_files, total_stats, files_by_extension
+    return answer.casefold() not in {"n", "no"}
 
 
 # =============================================================================
-# Command-line entry point
+# Argument parsing and option resolution
 # =============================================================================
+
 
 def create_argument_parser() -> argparse.ArgumentParser:
     """Create the command-line interface definition."""
@@ -859,22 +237,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--ext",
-        nargs="*",
-        metavar="EXTENSION",
-        help=(
-            "File extensions to include, for example: --ext .cs .cpp .hpp. "
-            "When omitted, the built-in extension list is used."
-        ),
-    )
-
-    parser.add_argument(
         "--folders",
         nargs="+",
         metavar="FOLDER",
         help=(
             "One or more source folders to scan, for example: "
-            "--folders src tests addons"
+            "--folders src tests tools"
         ),
     )
 
@@ -884,30 +252,121 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Open the native folder picker and select source folders.",
     )
 
+    parser.add_argument(
+        "--ext",
+        nargs="*",
+        metavar="EXTENSION",
+        help=(
+            "Use only these extensions. Values may be separated by spaces or "
+            "semicolons, for example: --ext .cs .cpp .hpp"
+        ),
+    )
+
+    parser.add_argument(
+        "--add-ext",
+        nargs="*",
+        metavar="EXTENSION",
+        help=(
+            "Add extensions to the built-in list. Values may be separated by "
+            "spaces or semicolons, for example: --add-ext .shader;.proto"
+        ),
+    )
+
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        metavar="DIRECTORY",
+        help=(
+            "Add directory names or paths to skip. A simple name is skipped at "
+            "every depth; a relative path is resolved from selected roots."
+        ),
+    )
+
+    timestamp_group = parser.add_mutually_exclusive_group()
+    timestamp_group.add_argument(
+        "--file-timestamps",
+        dest="include_file_timestamps",
+        action="store_true",
+        help="Include a last-modified timestamp for every source file.",
+    )
+    timestamp_group.add_argument(
+        "--no-file-timestamps",
+        dest="include_file_timestamps",
+        action="store_false",
+        help="Do not include per-file last-modified timestamps in the report.",
+    )
+    parser.set_defaults(include_file_timestamps=None)
+
     return parser
 
 
-def main() -> None:
-    """Run the interactive or command-line source combiner."""
+def resolve_extensions(args: argparse.Namespace, interactive_mode: bool) -> set[str]:
+    """Resolve default, replacement, and additional extension filters."""
+    if args.ext is not None:
+        extensions = normalize_extensions(args.ext)
+    else:
+        extensions = set(DEFAULT_EXTENSIONS)
+
+    if interactive_mode and args.ext is None and args.add_ext is None:
+        additional_values = prompt_additional_extensions()
+    else:
+        additional_values = args.add_ext
+
+    extensions.update(normalize_extensions(additional_values))
+    return extensions
+
+
+def resolve_exclusions(
+    args: argparse.Namespace,
+    source_directories: Sequence[Path],
+    interactive_mode: bool,
+):
+    """Resolve default and user-supplied directory exclusions."""
+    if interactive_mode and args.exclude is None:
+        raw_values = prompt_exclusions()
+    else:
+        raw_values = args.exclude
+
+    return build_exclusion_settings(raw_values, source_directories)
+
+
+def resolve_file_timestamps(args: argparse.Namespace, interactive_mode: bool) -> bool:
+    """Use CLI preference, interactive preference, or the default of True."""
+    if args.include_file_timestamps is not None:
+        return args.include_file_timestamps
+
+    if interactive_mode:
+        return prompt_file_timestamps()
+
+    return True
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+
+def main() -> int:
+    """Run the source-code combiner."""
     parser = create_argument_parser()
     args = parser.parse_args()
 
     root = Path(args.root).expanduser()
-
     try:
         root = root.resolve()
     except (OSError, RuntimeError):
         root = root.absolute()
 
-    source_directories = get_source_directories(args)
+    source_directories, interactive_mode = get_source_directories(args)
 
     if not source_directories:
         print("No valid source folders were selected.")
-        return
+        return 1
 
     output_path = get_output_path(args, root)
-    extensions = normalize_extensions(args.ext)
-
+    extensions = resolve_extensions(args, interactive_mode)
+    exclusions = resolve_exclusions(args, source_directories, interactive_mode)
+    include_file_timestamps = resolve_file_timestamps(args, interactive_mode)
     output_existed = output_path.exists()
 
     try:
@@ -915,33 +374,41 @@ def main() -> None:
             source_directories=source_directories,
             output_path=output_path,
             extensions=extensions,
+            exclusions=exclusions,
         )
     except OSError as error:
         print(f"Could not scan source folders: {error}")
-        return
+        return 1
 
     if not source_files:
         print("No files matching the selected extensions were found.")
-        return
+        return 1
 
     try:
-        included_files, skipped_files, total_stats, _ = write_combined_output(
+        result = write_combined_output(
             output_path=output_path,
             source_directories=source_directories,
             source_files=source_files,
+            extensions=extensions,
+            exclusions=exclusions,
+            include_file_timestamps=include_file_timestamps,
+            output_existed=output_existed,
         )
     except OSError as error:
         print(f"Could not write the output file: {error}")
-        return
+        return 1
 
     action = "updated" if output_existed else "created"
 
     print()
-    print(f"Done. Included files: {included_files}")
-    print(f"Skipped files: {skipped_files}")
-    print(f"Declarations: {format_stats(total_stats)}")
+    print(f"Done. Included files: {result.included_files}")
+    print(f"Skipped files: {result.skipped_files}")
+    print(f"Declarations: {format_stats(result.total_stats)}")
+    print(f"Report generated at: {result.generated_at.astimezone().isoformat(timespec='seconds')}")
     print(f"Output file {action}: {output_path}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,7 +1,9 @@
-# Generated code-combiner reports
+# Generated code-listing reports
 CodeOutput/
 combined_code.txt
 
-# Python cache files
+# Python cache and test artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/
+*.tmp
