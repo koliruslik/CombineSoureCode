@@ -805,6 +805,11 @@ def write_combined_output(
     exclusions: ExclusionSettings,
     include_file_timestamps: bool,
     output_existed: bool,
+    output_format: str = "report",
+    label_template: str = "// FILE: {path}",
+    blank_lines_before_label: int = 2,
+    blank_lines_after_label: int = 1,
+    blank_lines_between_files: int = 2,
 ) -> GenerationResult:
     """
     Write a complete report to a temporary file, then atomically replace target.
@@ -838,29 +843,30 @@ def write_combined_output(
         ) as output:
             temporary_path = Path(output.name)
 
-            output.write("COMBINED SOURCE CODE\n")
-            output.write("=" * 100 + "\n")
-            output.write(f"REPORT {output_action} AT: {format_timestamp(generated_at)}\n")
-            output.write(
-                "SOURCE FILE TIMESTAMPS: "
-                f"{'included' if include_file_timestamps else 'not included'}\n"
-            )
-            output.write("Selected source folders:\n")
+            if output_format == "report":
+                output.write("COMBINED SOURCE CODE\n")
+                output.write("=" * 100 + "\n")
+                output.write(f"REPORT {output_action} AT: {format_timestamp(generated_at)}\n")
+                output.write(
+                    "SOURCE FILE TIMESTAMPS: "
+                    f"{'included' if include_file_timestamps else 'not included'}\n"
+                )
+                output.write("Selected source folders:\n")
 
-            for source_directory in source_directories:
-                output.write(f"  {source_directory}\n")
+                for source_directory in source_directories:
+                    output.write(f"  {source_directory}\n")
 
-            output.write("Included file extensions:\n")
-            output.write("  " + " ".join(sorted(extensions)) + "\n")
+                output.write("Included file extensions:\n")
+                output.write("  " + " ".join(sorted(extensions)) + "\n")
 
-            if exclusions.requested_values:
-                output.write("Additional excluded directory names or paths:\n")
-                for requested_value in exclusions.requested_values:
-                    output.write(f"  {requested_value}\n")
-            else:
-                output.write("Additional excluded directory names or paths: none\n")
+                if exclusions.requested_values:
+                    output.write("Additional excluded directory names or paths:\n")
+                    for requested_value in exclusions.requested_values:
+                        output.write(f"  {requested_value}\n")
+                else:
+                    output.write("Additional excluded directory names or paths: none\n")
 
-            output.write(f"\nFiles found: {len(source_files)}\n\n")
+                output.write(f"\nFiles found: {len(source_files)}\n\n")
 
             for source_file in source_files:
                 content = read_file_safely(source_file.path)
@@ -885,42 +891,64 @@ def write_combined_output(
                 files_by_extension[extension] += 1
                 included_files += 1
 
+                stripped_content = content.rstrip()
+                if output_format == "report":
+                    output.write("=" * 100 + "\n")
+                    output.write(f"SOURCE ROOT: {source_file.source_root}\n")
+                    output.write(f"FILE: {visible_path}\n")
+                    if include_file_timestamps:
+                        timestamp_text = format_timestamp(modified_at) if modified_at else "unavailable"
+                        output.write(f"LAST MODIFIED: {timestamp_text}\n")
+                    output.write(f"DECLARATIONS: {format_stats(file_stats)}\n")
+                    output.write("=" * 100 + "\n\n")
+                    output.write(stripped_content)
+                    output.write("\n\n")
+                elif output_format == "labeled":
+                    if included_files > 1:
+                        output.write("\n" * (max(0, blank_lines_before_label) + 1))
+                    output.write(label_template.format(
+                        path=visible_path,
+                        name=source_file.path.name,
+                        extension=extension,
+                        root=source_file.source_root,
+                    ).rstrip())
+                    output.write("\n" * (max(0, blank_lines_after_label) + 1))
+                    output.write(stripped_content)
+                elif output_format == "plain":
+                    if included_files > 1:
+                        output.write("\n" * (max(0, blank_lines_between_files) + 1))
+                    output.write(stripped_content)
+                else:
+                    raise ValueError(f"Unknown output format: {output_format}")
+
+            if output_format == "report":
                 output.write("=" * 100 + "\n")
-                output.write(f"SOURCE ROOT: {source_file.source_root}\n")
-                output.write(f"FILE: {visible_path}\n")
+                output.write("PROJECT STATISTICS\n")
+                output.write("=" * 100 + "\n")
+                output.write(f"Report generated at: {format_timestamp(generated_at)}\n")
+                output.write(f"Files included: {included_files}\n")
+                output.write(f"Files skipped: {skipped_files}\n")
+                output.write(f"Declarations: {format_stats(total_stats)}\n")
+
                 if include_file_timestamps:
-                    timestamp_text = format_timestamp(modified_at) if modified_at else "unavailable"
-                    output.write(f"LAST MODIFIED: {timestamp_text}\n")
-                output.write(f"DECLARATIONS: {format_stats(file_stats)}\n")
-                output.write("=" * 100 + "\n\n")
-                output.write(content.rstrip())
-                output.write("\n\n")
+                    if oldest_source is not None:
+                        output.write(
+                            "Oldest included source file: "
+                            f"{format_timestamp(oldest_source[0])} | "
+                            f"{display_file_path(oldest_source[1])}\n"
+                        )
+                    if newest_source is not None:
+                        output.write(
+                            "Newest included source file: "
+                            f"{format_timestamp(newest_source[0])} | "
+                            f"{display_file_path(newest_source[1])}\n"
+                        )
 
-            output.write("=" * 100 + "\n")
-            output.write("PROJECT STATISTICS\n")
-            output.write("=" * 100 + "\n")
-            output.write(f"Report generated at: {format_timestamp(generated_at)}\n")
-            output.write(f"Files included: {included_files}\n")
-            output.write(f"Files skipped: {skipped_files}\n")
-            output.write(f"Declarations: {format_stats(total_stats)}\n")
-
-            if include_file_timestamps:
-                if oldest_source is not None:
-                    output.write(
-                        "Oldest included source file: "
-                        f"{format_timestamp(oldest_source[0])} | "
-                        f"{display_file_path(oldest_source[1])}\n"
-                    )
-                if newest_source is not None:
-                    output.write(
-                        "Newest included source file: "
-                        f"{format_timestamp(newest_source[0])} | "
-                        f"{display_file_path(newest_source[1])}\n"
-                    )
-
-            output.write("\nFiles by extension:\n")
-            for extension, count in sorted(files_by_extension.items()):
-                output.write(f"  {extension}: {count}\n")
+                output.write("\nFiles by extension:\n")
+                for extension, count in sorted(files_by_extension.items()):
+                    output.write(f"  {extension}: {count}\n")
+            else:
+                output.write("\n")
 
         # Path.replace() overwrites the existing report without creating a
         # duplicate name such as "combined_code (1).txt".

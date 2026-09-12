@@ -41,6 +41,31 @@ Keep `combine_code.py` and `combiner_core.py` in the same directory. The first f
 - Write to a temporary file before replacement, so a previous report survives a failed generation.
 - Include a report generation timestamp and optional last-modified timestamps for every included source file.
 - Count language-appropriate declarations per file and for the overall report.
+- Choose `report`, `labeled`, or `plain` output without changing the source files.
+- Keep portable default paths and separator settings in `combiner_config.json`.
+- Replace the same configured output files instead of accumulating numbered copies.
+
+## Output Profiles
+
+- `report` preserves the original detailed report, timestamps, declaration counts, and summary.
+- `labeled` writes a short configurable file/path label before each source file.
+- `plain` writes only source contents with configurable blank lines between files.
+
+On Windows, use `run_combiner_report.cmd`, `run_combiner_labeled.cmd`, or `run_combiner_plain.cmd`. All three use the default output directory from `combiner_config.json`.
+
+Config paths are resolved relative to the JSON file, so they continue to work after the archive is synced to a different drive or PC.
+
+```json
+{
+  "default_root": "../../..",
+  "default_output_directory": "../../../90_Temporary/Exports/CodeListingCombiner",
+  "default_format": "report",
+  "label_template": "// FILE: {path}",
+  "blank_lines_before_label": 2,
+  "blank_lines_after_label": 1,
+  "blank_lines_between_files": 2
+}
+```
 
 ## Quick Start on Windows
 

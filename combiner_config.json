@@ -1,0 +1,14 @@
+{
+  "default_root": "../../..",
+  "default_output_directory": "../../../90_Temporary/Exports/CodeListingCombiner",
+  "default_format": "report",
+  "output_files": {
+    "report": "combined_report.txt",
+    "labeled": "combined_labeled.txt",
+    "plain": "combined_plain.txt"
+  },
+  "label_template": "// FILE: {path}",
+  "blank_lines_before_label": 2,
+  "blank_lines_after_label": 1,
+  "blank_lines_between_files": 2
+}

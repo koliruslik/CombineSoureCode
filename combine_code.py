@@ -9,6 +9,7 @@ replacement to combiner_core.py.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -23,6 +24,30 @@ from combiner_core import (
     validate_folders,
     write_combined_output,
 )
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = SCRIPT_DIRECTORY / "combiner_config.json"
+
+
+def load_config(path: Path) -> dict:
+    """Load an optional JSON configuration file."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not read config {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise ValueError(f"Config root must be a JSON object: {path}")
+    return data
+
+
+def resolve_config_path(value: str, config_directory: Path) -> Path:
+    """Resolve a portable config path relative to the config file."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_directory / path
+    return path.resolve()
 
 
 # =============================================================================
@@ -148,10 +173,25 @@ def get_source_directories(args: argparse.Namespace) -> tuple[list[Path], bool]:
     return unique_folders, interactive_mode
 
 
-def get_output_path(args: argparse.Namespace, root: Path) -> Path:
-    """Use --output when supplied; otherwise request an output file path."""
+def get_output_path(
+    args: argparse.Namespace,
+    root: Path,
+    config: dict,
+    config_directory: Path,
+    output_format: str,
+) -> Path:
+    """Use CLI output, configured profile output, or an interactive fallback."""
     if args.output:
         return normalize_output_path(args.output, root)
+
+    output_directory = config.get("default_output_directory")
+    output_files = config.get("output_files", {})
+    if output_directory and isinstance(output_files, dict):
+        file_name = output_files.get(output_format)
+        if file_name:
+            path = resolve_config_path(str(output_directory), config_directory) / str(file_name)
+            print(f"Using configured output: {path}")
+            return path
 
     print()
     print("Choose the output file name or path.")
@@ -221,12 +261,29 @@ def create_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--root",
-        default=".",
+        default=None,
         help=(
             "Base directory used for relative output paths. "
-            "Defaults to the current directory."
+            "Defaults to default_root from the JSON config."
         ),
     )
+
+    parser.add_argument(
+        "--config",
+        help="JSON config path. Defaults to combiner_config.json beside the script.",
+    )
+
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("report", "labeled", "plain"),
+        help="Output profile. Defaults to the configured default_format.",
+    )
+
+    parser.add_argument("--label-template", help="Labeled profile template; supports {path}, {name}, {extension}, and {root}.")
+    parser.add_argument("--blank-lines-before-label", type=int)
+    parser.add_argument("--blank-lines-after-label", type=int)
+    parser.add_argument("--blank-lines-between-files", type=int)
 
     parser.add_argument(
         "--output",
@@ -351,7 +408,20 @@ def main() -> int:
     parser = create_argument_parser()
     args = parser.parse_args()
 
-    root = Path(args.root).expanduser()
+    config_path = Path(args.config).expanduser().resolve() if args.config else DEFAULT_CONFIG_PATH
+    try:
+        config = load_config(config_path)
+    except ValueError as error:
+        print(error)
+        return 2
+
+    config_directory = config_path.parent
+    if args.root:
+        root = Path(args.root).expanduser()
+    elif config.get("default_root"):
+        root = resolve_config_path(str(config["default_root"]), config_directory)
+    else:
+        root = Path.cwd()
     try:
         root = root.resolve()
     except (OSError, RuntimeError):
@@ -363,7 +433,12 @@ def main() -> int:
         print("No valid source folders were selected.")
         return 1
 
-    output_path = get_output_path(args, root)
+    output_format = args.output_format or str(config.get("default_format", "report"))
+    if output_format not in {"report", "labeled", "plain"}:
+        print(f"Unknown configured output format: {output_format}")
+        return 2
+
+    output_path = get_output_path(args, root, config, config_directory, output_format)
     extensions = resolve_extensions(args, interactive_mode)
     exclusions = resolve_exclusions(args, source_directories, interactive_mode)
     include_file_timestamps = resolve_file_timestamps(args, interactive_mode)
@@ -393,8 +468,13 @@ def main() -> int:
             exclusions=exclusions,
             include_file_timestamps=include_file_timestamps,
             output_existed=output_existed,
+            output_format=output_format,
+            label_template=args.label_template or str(config.get("label_template", "// FILE: {path}")),
+            blank_lines_before_label=args.blank_lines_before_label if args.blank_lines_before_label is not None else int(config.get("blank_lines_before_label", 2)),
+            blank_lines_after_label=args.blank_lines_after_label if args.blank_lines_after_label is not None else int(config.get("blank_lines_after_label", 1)),
+            blank_lines_between_files=args.blank_lines_between_files if args.blank_lines_between_files is not None else int(config.get("blank_lines_between_files", 2)),
         )
-    except OSError as error:
+    except (OSError, ValueError, KeyError) as error:
         print(f"Could not write the output file: {error}")
         return 1
 
@@ -403,6 +483,7 @@ def main() -> int:
     print()
     print(f"Done. Included files: {result.included_files}")
     print(f"Skipped files: {result.skipped_files}")
+    print(f"Output format: {output_format}")
     print(f"Declarations: {format_stats(result.total_stats)}")
     print(f"Report generated at: {result.generated_at.astimezone().isoformat(timespec='seconds')}")
     print(f"Output file {action}: {output_path}")
