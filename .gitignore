@@ -1,5 +1,6 @@
 # Generated code-listing reports
 CodeOutput/
+Out/
 combined_code.txt
 
 # Python cache and test artifacts
